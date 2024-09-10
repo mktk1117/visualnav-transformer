@@ -1,14 +1,20 @@
 import argparse
 import os
-from utils import msg_to_pil 
+from utils import msg_to_pil
 import time
+import numpy as np
+import cv2
 
 # ROS
 import rospy
 from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage
 from sensor_msgs.msg import Joy
 
-IMAGE_TOPIC = "/usb_cam/image_raw"
+from PIL import Image as PILImage
+
+
+IMAGE_TOPIC = "/hdr_camera_front/image_raw/compressed"  # "/usb_cam/image_raw"
 TOPOMAP_IMAGES_DIR = "../topomaps/images"
 obs_img = None
 
@@ -30,6 +36,13 @@ def callback_obs(msg: Image):
     obs_img = msg_to_pil(msg)
 
 
+def callback_obs_compressed(msg: CompressedImage):
+    global obs_img
+    np_arr = np.fromstring(msg.data, np.uint8)
+    image_np = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    obs_img = PILImage.fromarray(cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB))
+
+
 def callback_joy(msg: Joy):
     if msg.buttons[0]:
         rospy.signal_shutdown("shutdown")
@@ -38,10 +51,11 @@ def callback_joy(msg: Joy):
 def main(args: argparse.Namespace):
     global obs_img
     rospy.init_node("CREATE_TOPOMAP", anonymous=False)
-    image_curr_msg = rospy.Subscriber(
-        IMAGE_TOPIC, Image, callback_obs, queue_size=1)
-    subgoals_pub = rospy.Publisher(
-        "/subgoals", Image, queue_size=1)
+    if "compressed" in IMAGE_TOPIC:
+        image_curr_msg = rospy.Subscriber(IMAGE_TOPIC, CompressedImage, callback_obs_compressed, queue_size=1)
+    else:
+        image_curr_msg = rospy.Subscriber(IMAGE_TOPIC, Image, callback_obs, queue_size=1)
+    subgoals_pub = rospy.Publisher("/subgoals", Image, queue_size=1)
     joy_sub = rospy.Subscriber("joy", Joy, callback_joy)
 
     topomap_name_dir = os.path.join(TOPOMAP_IMAGES_DIR, args.dir)
@@ -50,10 +64,9 @@ def main(args: argparse.Namespace):
     else:
         print(f"{topomap_name_dir} already exists. Removing previous images...")
         remove_files_in_dir(topomap_name_dir)
-        
 
     assert args.dt > 0, "dt must be positive"
-    rate = rospy.Rate(1/args.dt)
+    rate = rospy.Rate(1 / args.dt)
     print("Registered with master node. Waiting for images...")
     i = 0
     start_time = float("inf")
@@ -71,9 +84,7 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description=f"Code to generate topomaps from the {IMAGE_TOPIC} topic"
-    )
+    parser = argparse.ArgumentParser(description=f"Code to generate topomaps from the {IMAGE_TOPIC} topic")
     parser.add_argument(
         "--dir",
         "-d",
@@ -84,7 +95,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dt",
         "-t",
-        default=1.,
+        default=1.0,
         type=float,
         help=f"time between images sampled from the {IMAGE_TOPIC} topic (default: 3.0)",
     )

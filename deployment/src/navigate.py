@@ -11,7 +11,7 @@ import yaml
 
 # ROS
 import rospy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import Bool, Float32MultiArray
 from utils import msg_to_pil, to_numpy, transform_images, load_model
 
@@ -22,30 +22,29 @@ import numpy as np
 import argparse
 import yaml
 import time
+import cv2
 
 # UTILS
-from topic_names import (IMAGE_TOPIC,
-                        WAYPOINT_TOPIC,
-                        SAMPLED_ACTIONS_TOPIC)
+from topic_names import IMAGE_TOPIC, WAYPOINT_TOPIC, SAMPLED_ACTIONS_TOPIC
 
 
 # CONSTANTS
 TOPOMAP_IMAGES_DIR = "../topomaps/images"
 MODEL_WEIGHTS_PATH = "../model_weights"
-ROBOT_CONFIG_PATH ="../config/robot.yaml"
+ROBOT_CONFIG_PATH = "../config/robot.yaml"
 MODEL_CONFIG_PATH = "../config/models.yaml"
 with open(ROBOT_CONFIG_PATH, "r") as f:
     robot_config = yaml.safe_load(f)
 MAX_V = robot_config["max_v"]
 MAX_W = robot_config["max_w"]
-RATE = robot_config["frame_rate"] 
+RATE = robot_config["frame_rate"]
 
 # GLOBALS
 context_queue = []
-context_size = None  
+context_size = None
 subgoal = []
 
-# Load the model 
+# Load the model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
@@ -60,10 +59,28 @@ def callback_obs(msg):
             context_queue.append(obs_img)
 
 
+def callback_obs_compressed(msg: CompressedImage):
+    """
+    Callback function to handle compressed image messages.
+    """
+    # Decompress the image
+    np_arr = np.fromstring(msg.data, np.uint8)
+    image_np = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    obs_img = PILImage.fromarray(cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB))
+
+    # Add the image to the context queue
+    if context_size is not None:
+        if len(context_queue) < context_size + 1:
+            context_queue.append(obs_img)
+        else:
+            context_queue.pop(0)
+            context_queue.append(obs_img)
+
+
 def main(args: argparse.Namespace):
     global context_size
 
-     # load model parameters
+    # load model parameters
     with open(MODEL_CONFIG_PATH, "r") as f:
         model_paths = yaml.safe_load(f)
 
@@ -87,10 +104,10 @@ def main(args: argparse.Namespace):
     model = model.to(device)
     model.eval()
 
-    
-     # load topomap
-    topomap_filenames = sorted(os.listdir(os.path.join(
-        TOPOMAP_IMAGES_DIR, args.dir)), key=lambda x: int(x.split(".")[0]))
+    # load topomap
+    topomap_filenames = sorted(
+        os.listdir(os.path.join(TOPOMAP_IMAGES_DIR, args.dir)), key=lambda x: int(x.split(".")[0])
+    )
     topomap_dir = f"{TOPOMAP_IMAGES_DIR}/{args.dir}"
     num_nodes = len(os.listdir(topomap_dir))
     topomap = []
@@ -106,13 +123,14 @@ def main(args: argparse.Namespace):
         goal_node = args.goal_node
     reached_goal = False
 
-     # ROS
+    # ROS
     rospy.init_node("EXPLORATION", anonymous=False)
     rate = rospy.Rate(RATE)
-    image_curr_msg = rospy.Subscriber(
-        IMAGE_TOPIC, Image, callback_obs, queue_size=1)
-    waypoint_pub = rospy.Publisher(
-        WAYPOINT_TOPIC, Float32MultiArray, queue_size=1)  
+    if "compressed" in IMAGE_TOPIC:
+        image_curr_msg = rospy.Subscriber(IMAGE_TOPIC, CompressedImage, callback_obs_compressed, queue_size=1)
+    else:
+        image_curr_msg = rospy.Subscriber(IMAGE_TOPIC, Image, callback_obs, queue_size=1)
+    waypoint_pub = rospy.Publisher(WAYPOINT_TOPIC, Float32MultiArray, queue_size=1)
     sampled_actions_pub = rospy.Publisher(SAMPLED_ACTIONS_TOPIC, Float32MultiArray, queue_size=1)
     goal_pub = rospy.Publisher("/topoplan/reached_goal", Bool, queue_size=1)
 
@@ -122,9 +140,9 @@ def main(args: argparse.Namespace):
         num_diffusion_iters = model_params["num_diffusion_iters"]
         noise_scheduler = DDPMScheduler(
             num_train_timesteps=model_params["num_diffusion_iters"],
-            beta_schedule='squaredcos_cap_v2',
+            beta_schedule="squaredcos_cap_v2",
             clip_sample=True,
-            prediction_type='epsilon'
+            prediction_type="epsilon",
         )
     # navigation loop
     while not rospy.is_shutdown():
@@ -134,16 +152,24 @@ def main(args: argparse.Namespace):
             if model_params["model_type"] == "nomad":
                 obs_images = transform_images(context_queue, model_params["image_size"], center_crop=False)
                 obs_images = torch.split(obs_images, 3, dim=1)
-                obs_images = torch.cat(obs_images, dim=1) 
+                obs_images = torch.cat(obs_images, dim=1)
                 obs_images = obs_images.to(device)
-                mask = torch.zeros(1).long().to(device)  
+                mask = torch.zeros(1).long().to(device)
 
                 start = max(closest_node - args.radius, 0)
                 end = min(closest_node + args.radius + 1, goal_node)
-                goal_image = [transform_images(g_img, model_params["image_size"], center_crop=False).to(device) for g_img in topomap[start:end + 1]]
+                goal_image = [
+                    transform_images(g_img, model_params["image_size"], center_crop=False).to(device)
+                    for g_img in topomap[start : end + 1]
+                ]
                 goal_image = torch.concat(goal_image, dim=0)
 
-                obsgoal_cond = model('vision_encoder', obs_img=obs_images.repeat(len(goal_image), 1, 1, 1), goal_img=goal_image, input_goal_mask=mask.repeat(len(goal_image)))
+                obsgoal_cond = model(
+                    "vision_encoder",
+                    obs_img=obs_images.repeat(len(goal_image), 1, 1, 1),
+                    goal_img=goal_image,
+                    input_goal_mask=mask.repeat(len(goal_image)),
+                )
                 dists = model("dist_pred_net", obsgoal_cond=obsgoal_cond)
                 dists = to_numpy(dists.flatten())
                 min_idx = np.argmin(dists)
@@ -159,10 +185,9 @@ def main(args: argparse.Namespace):
                         obs_cond = obs_cond.repeat(args.num_samples, 1)
                     else:
                         obs_cond = obs_cond.repeat(args.num_samples, 1, 1)
-                    
+
                     # initialize action from Gaussian noise
-                    noisy_action = torch.randn(
-                        (args.num_samples, model_params["len_traj_pred"], 2), device=device)
+                    noisy_action = torch.randn((args.num_samples, model_params["len_traj_pred"], 2), device=device)
                     naction = noisy_action
 
                     # init scheduler
@@ -171,18 +196,9 @@ def main(args: argparse.Namespace):
                     start_time = time.time()
                     for k in noise_scheduler.timesteps[:]:
                         # predict noise
-                        noise_pred = model(
-                            'noise_pred_net',
-                            sample=naction,
-                            timestep=k,
-                            global_cond=obs_cond
-                        )
+                        noise_pred = model("noise_pred_net", sample=naction, timestep=k, global_cond=obs_cond)
                         # inverse diffusion step (remove noise)
-                        naction = noise_scheduler.step(
-                            model_output=noise_pred,
-                            timestep=k,
-                            sample=naction
-                        ).prev_sample
+                        naction = noise_scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
                     print("time elapsed:", time.time() - start_time)
 
                 naction = to_numpy(get_action(naction))
@@ -190,7 +206,7 @@ def main(args: argparse.Namespace):
                 sampled_actions_msg.data = np.concatenate((np.array([0]), naction.flatten()))
                 print("published sampled actions")
                 sampled_actions_pub.publish(sampled_actions_msg)
-                naction = naction[0] 
+                naction = naction[0]
                 chosen_waypoint = naction[args.waypoint]
             else:
                 start = max(closest_node - args.radius, 0)
@@ -199,12 +215,12 @@ def main(args: argparse.Namespace):
                 waypoints = []
                 batch_obs_imgs = []
                 batch_goal_data = []
-                for i, sg_img in enumerate(topomap[start: end + 1]):
+                for i, sg_img in enumerate(topomap[start : end + 1]):
                     transf_obs_img = transform_images(context_queue, model_params["image_size"])
                     goal_data = transform_images(sg_img, model_params["image_size"])
                     batch_obs_imgs.append(transf_obs_img)
                     batch_goal_data.append(goal_data)
-                    
+
                 # predict distances and waypoints
                 batch_obs_imgs = torch.cat(batch_obs_imgs, dim=0).to(device)
                 batch_goal_data = torch.cat(batch_goal_data, dim=0).to(device)
@@ -219,12 +235,11 @@ def main(args: argparse.Namespace):
                     chosen_waypoint = waypoints[min_dist_idx][args.waypoint]
                     closest_node = start + min_dist_idx
                 else:
-                    chosen_waypoint = waypoints[min(
-                        min_dist_idx + 1, len(waypoints) - 1)][args.waypoint]
+                    chosen_waypoint = waypoints[min(min_dist_idx + 1, len(waypoints) - 1)][args.waypoint]
                     closest_node = min(start + min_dist_idx + 1, goal_node)
         # RECOVERY MODE
         if model_params["normalize"]:
-            chosen_waypoint[:2] *= (MAX_V / RATE)  
+            chosen_waypoint[:2] *= MAX_V / RATE
         waypoint_msg = Float32MultiArray()
         waypoint_msg.data = chosen_waypoint
         waypoint_pub.publish(waypoint_msg)
@@ -236,8 +251,7 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Code to run GNM DIFFUSION EXPLORATION on the locobot")
+    parser = argparse.ArgumentParser(description="Code to run GNM DIFFUSION EXPLORATION on the locobot")
     parser.add_argument(
         "--model",
         "-m",
@@ -248,7 +262,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--waypoint",
         "-w",
-        default=2, # close waypoints exihibit straight line motion (the middle waypoint is a good default)
+        default=2,  # close waypoints exihibit straight line motion (the middle waypoint is a good default)
         type=int,
         help=f"""index of the waypoint used for navigation (between 0 and 4 or 
         how many waypoints your model predicts) (default: 2)""",
@@ -294,5 +308,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(f"Using {device}")
     main(args)
-
-
